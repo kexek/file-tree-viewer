@@ -1,3 +1,4 @@
+file_tree_viewer.py
 setup.py
 file_tree_viewer.egg-info/PKG-INFO
 file_tree_viewer.egg-info/SOURCES.txt

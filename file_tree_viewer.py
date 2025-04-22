@@ -2,7 +2,7 @@
 import os
 import sys
 import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext
+from tkinter import ttk, filedialog
 import threading
 import argparse
 import json
@@ -10,6 +10,7 @@ import time
 from functools import lru_cache
 import re
 import subprocess
+from pathlib import Path
 
 # Configuration
 CONFIG_DIR = os.path.expanduser("~/.file-tree-viewer")
@@ -17,8 +18,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 # Default configuration
 DEFAULT_CONFIG = {
-    "ignored_patterns": [".git", "__pycache__", "*.pyc", "*.pyo", "*.jpg", "*.png", "*.gif", "*.pdf", "*.DS_Store"],
-    "max_lines": 50,
+    "ignored_patterns": ["__pycache__", "*.pyc", "*.pyo", "*.jpg", "*.png", "*.gif", "*.pdf"],
     "recent_directories": [],
     "window_size": [800, 600]
 }
@@ -50,7 +50,8 @@ def save_config(config):
 
 # Cache for file contents to improve performance
 @lru_cache(maxsize=100)
-def get_file_content(file_path, max_lines=None):
+def get_file_content(file_path):
+    """Get the full content of a file, with proper error handling"""
     try:
         # Check if file exists and is readable
         if not os.path.isfile(file_path) or not os.access(file_path, os.R_OK):
@@ -62,18 +63,9 @@ def get_file_content(file_path, max_lines=None):
             if b'\x00' in first_bytes:
                 return "(Бинарный файл, содержимое не отображается)"
         
-        # Read text content
+        # Read text content (full file)
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            if max_lines:
-                lines = []
-                for i, line in enumerate(f):
-                    if i >= max_lines:
-                        lines.append("... (truncated, file has more content) ...\n")
-                        break
-                    lines.append(line)
-                content = ''.join(lines)
-            else:
-                content = f.read()
+            content = f.read()
         return content
     except UnicodeDecodeError:
         return "(Бинарный файл, содержимое не отображается)"
@@ -83,6 +75,7 @@ def get_file_content(file_path, max_lines=None):
 def should_ignore(path, ignore_patterns):
     """Check if a file/directory should be ignored based on patterns"""
     filename = os.path.basename(path)
+    
     for pattern in ignore_patterns:
         # Direct match
         if pattern == filename:
@@ -112,6 +105,21 @@ class FileTreeViewer(tk.Tk):
         self.title("File Tree Viewer")
         self.geometry(f"{self.config_data['window_size'][0]}x{self.config_data['window_size'][1]}")
         
+        # Configure Tkinter to show hidden files
+        try:
+            # Call a dummy dialog with an impossible option to initialize the file dialog
+            # without really getting a dialog window; this will throw a TclError
+            try:
+                self.tk.call('tk_getOpenFile', '-foobarbaz')
+            except tk.TclError:
+                pass
+            
+            # Now set the magic variables to show hidden files
+            self.tk.call('set', '::tk::dialog::file::showHiddenBtn', '1')
+            self.tk.call('set', '::tk::dialog::file::showHiddenVar', '1')
+        except Exception as e:
+            print(f"Warning: Could not configure Tkinter to show hidden files: {e}")
+        
         # Set window icon if available
         try:
             self.iconbitmap('file-tree-icon.ico')  # You can create and include an icon file
@@ -120,7 +128,6 @@ class FileTreeViewer(tk.Tk):
         
         # Variables
         self.current_dir = tk.StringVar(value=initial_dir or os.getcwd())
-        self.max_lines = tk.IntVar(value=self.config_data["max_lines"])
         self.status_text = tk.StringVar(value="Ready")
         self.is_loading = False
         self.tree_items = {}
@@ -149,10 +156,6 @@ class FileTreeViewer(tk.Tk):
         toolbar2 = ttk.Frame(main_frame)
         toolbar2.pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Label(toolbar2, text="Max lines:").pack(side=tk.LEFT, padx=(0, 5))
-        lines_spinbox = ttk.Spinbox(toolbar2, from_=1, to=1000, width=5, textvariable=self.max_lines)
-        lines_spinbox.pack(side=tk.LEFT, padx=(0, 10))
-        
         # Check/uncheck buttons
         check_all_btn = ttk.Button(toolbar2, text="Check All", command=self.check_all)
         check_all_btn.pack(side=tk.LEFT, padx=(0, 5))
@@ -161,29 +164,33 @@ class FileTreeViewer(tk.Tk):
         uncheck_all_btn.pack(side=tk.LEFT, padx=(0, 5))
         
         # Generate output button
-        generate_btn = ttk.Button(toolbar2, text="Generate Output", command=self.generate_output)
+        generate_btn = ttk.Button(toolbar2, text="Generate & Copy Output", command=self.generate_output)
         generate_btn.pack(side=tk.RIGHT, padx=(5, 0))
         
-        # Create paned window for tree and output
-        paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True)
+        # Frame for tree with scrollbar
+        tree_frame = ttk.Frame(main_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Frame for tree
-        tree_frame = ttk.Frame(paned)
-        paned.add(tree_frame, weight=1)
+        # Set up tree style for checkboxes
+        style = ttk.Style(self)
+        style.configure("Treeview", rowheight=25)  # Increase row height for checkboxes
         
         # Tree with checkboxes
         self.tree = ttk.Treeview(tree_frame, selectmode="browse")
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         # Add scrollbar to tree
-        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Configure tree columns
+        tree_scroll_x = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        tree_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        self.tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
+        
+        # Configure tree columns - Add proper checkbox column
         self.tree["columns"] = ("checked",)
-        self.tree.column("#0", width=300, minwidth=150)
+        self.tree.column("#0", width=400, minwidth=200)
         self.tree.column("checked", width=50, anchor=tk.CENTER)
         self.tree.heading("#0", text="Files and Directories")
         self.tree.heading("checked", text="✓")
@@ -192,17 +199,9 @@ class FileTreeViewer(tk.Tk):
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         self.tree.bind("<Button-1>", self.on_tree_click)
         
-        # Frame for output text
-        output_frame = ttk.LabelFrame(paned, text="Output Preview")
-        paned.add(output_frame, weight=1)
-        
-        # Output text area
-        self.output_text = scrolledtext.ScrolledText(output_frame, wrap=tk.WORD, font=("Courier", 10))
-        self.output_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
         # Status bar
         status_bar = ttk.Label(main_frame, textvariable=self.status_text, relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(5, 0))
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(10, 0))
         
         # Populate recent directories menu
         self.create_menu()
@@ -216,6 +215,9 @@ class FileTreeViewer(tk.Tk):
             
         # Bind window close event
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # UI for showing copy notification
+        self.copy_notification = None
     
     def create_menu(self):
         """Create application menu"""
@@ -247,7 +249,7 @@ class FileTreeViewer(tk.Tk):
         
         # Add menus to menu bar
         menu_bar.add_cascade(label="File", menu=file_menu)
-        menu_bar.add_cascade(label="Settings", menu=file_menu)
+        menu_bar.add_cascade(label="Settings", menu=settings_menu)
         menu_bar.add_cascade(label="Help", menu=help_menu)
         
         self.config(menu=menu_bar)
@@ -309,6 +311,7 @@ class FileTreeViewer(tk.Tk):
             self.tree.delete(item)
         
         self.tree_items = {}
+        self.checked_items = set()
         
         # Start loading thread
         directory = self.current_dir.get()
@@ -321,52 +324,83 @@ class FileTreeViewer(tk.Tk):
             # Get the ignored patterns from config
             ignored_patterns = self.config_data.get("ignored_patterns", DEFAULT_CONFIG["ignored_patterns"])
             
+            # We need to use after to update the status from the main thread
+            self.after(0, lambda: self.status_text.set("Loading directory structure..."))
+            
             # Populate tree
             self.populate_tree("", directory, ignored_patterns)
             
             # Update status when done
-            self.status_text.set(f"Loaded directory: {directory}")
+            self.after(0, lambda: self.status_text.set(f"Loaded directory: {directory}"))
         except Exception as e:
-            self.status_text.set(f"Error loading directory: {str(e)}")
+            # Use after to update UI from the main thread
+            self.after(0, lambda: self.status_text.set(f"Error loading directory: {str(e)}"))
         finally:
-            self.is_loading = False
+            # Update loading flag in the main thread
+            self.after(0, lambda: setattr(self, 'is_loading', False))
     
     def populate_tree(self, parent, directory, ignored_patterns):
-        """Recursively populate the tree"""
+        """Recursively populate the tree including all files"""
         try:
-            items = sorted(os.listdir(directory))
+            # Function to get all files including hidden ones
+            def get_all_files(path):
+                try:
+                    all_items = []
+                    for item in os.listdir(path):
+                        item_path = os.path.join(path, item)
+                        all_items.append(item_path)
+                    return all_items
+                except PermissionError:
+                    return []
+                except Exception as e:
+                    print(f"Error scanning {path}: {e}")
+                    return []
             
-            for item in items:
-                item_path = os.path.join(directory, item)
-                
-                # Check if should be ignored
-                is_ignored = should_ignore(item_path, ignored_patterns)
-                
-                # Special handling for node_modules
-                is_node_modules = (item == "node_modules")
-                
-                # Generate item ID
-                item_id = item_path.replace('/', '_').replace('\\', '_').replace(':', '_')
+            # Get all items
+            all_items = get_all_files(directory)
+            
+            # If no items could be retrieved, show error
+            if not all_items:
+                error_id = f"{parent}_error_{hash(directory)}"
+                self.tree.insert(parent, "end", error_id, text=f"Error: Permission denied or empty directory")
+                return
+            
+            # Split into directories and files
+            dirs = []
+            files = []
+            
+            for item_path in all_items:
+                item_name = os.path.basename(item_path)
+                    
+                # Skip . and .. entries
+                if item_name in ['.', '..']:
+                    continue
+                    
+                # Skip ignored items
+                if should_ignore(item_path, ignored_patterns):
+                    continue
+                    
+                if os.path.isdir(item_path):
+                    dirs.append((item_name, item_path))
+                else:
+                    files.append((item_name, item_path))
+            
+            # Sort each group alphabetically
+            dirs.sort(key=lambda x: x[0].lower())
+            files.sort(key=lambda x: x[0].lower())
+            
+            # Process directories first, then files
+            for item_name, item_path in dirs + files:
+                # Generate item ID (ensure uniqueness even with special chars)
+                unique_id = f"{parent}_{str(hash(item_path))}"
                 
                 if os.path.isdir(item_path):
                     # Add directory item
-                    if is_node_modules:
-                        # For node_modules, add with special label but don't expand
+                    if item_name == "node_modules":
+                        # Special handling for node_modules
                         tree_id = self.tree.insert(
-                            parent, "end", item_id, 
-                            text=f"{item} (skipped content)",
-                            values=("⬜", "directory", item_path)
-                        )
-                        self.tree_items[tree_id] = {
-                            "path": item_path, 
-                            "type": "directory",
-                            "is_ignored": True
-                        }
-                    elif is_ignored:
-                        # For ignored directories, add them but don't expand
-                        tree_id = self.tree.insert(
-                            parent, "end", item_id, 
-                            text=item,
+                            parent, "end", unique_id, 
+                            text=f"{item_name} (skipped content)",
                             values=("⬜", "directory", item_path)
                         )
                         self.tree_items[tree_id] = {
@@ -377,8 +411,8 @@ class FileTreeViewer(tk.Tk):
                     else:
                         # Normal directory
                         tree_id = self.tree.insert(
-                            parent, "end", item_id, 
-                            text=item,
+                            parent, "end", unique_id, 
+                            text=item_name,
                             values=("⬜", "directory", item_path)
                         )
                         self.tree_items[tree_id] = {
@@ -391,20 +425,19 @@ class FileTreeViewer(tk.Tk):
                         self.populate_tree(tree_id, item_path, ignored_patterns)
                 else:
                     # Add file item
-                    if not is_ignored:
-                        tree_id = self.tree.insert(
-                            parent, "end", item_id, 
-                            text=item,
-                            values=("⬜", "file", item_path)
-                        )
-                        self.tree_items[tree_id] = {
-                            "path": item_path, 
-                            "type": "file",
-                            "is_ignored": False
-                        }
+                    tree_id = self.tree.insert(
+                        parent, "end", unique_id, 
+                        text=item_name,
+                        values=("⬜", "file", item_path)
+                    )
+                    self.tree_items[tree_id] = {
+                        "path": item_path, 
+                        "type": "file",
+                        "is_ignored": False
+                    }
         except Exception as e:
-            # Handle permission errors etc.
-            error_id = directory.replace('/', '_').replace('\\', '_').replace(':', '_') + "_error"
+            # Handle errors
+            error_id = f"{parent}_error_{hash(directory)}"
             self.tree.insert(parent, "end", error_id, text=f"Error: {str(e)}")
     
     def on_tree_double_click(self, event):
@@ -419,15 +452,9 @@ class FileTreeViewer(tk.Tk):
         if not item_info:
             return
             
-        # If it's a file, show content in output
+        # If it's a file, toggle its checked state
         if item_info["type"] == "file" and not item_info["is_ignored"]:
-            path = item_info["path"]
-            content = get_file_content(path, self.max_lines.get())
-            
-            # Display in output text
-            self.output_text.delete(1.0, tk.END)
-            self.output_text.insert(tk.END, f"File: {path}\n\n")
-            self.output_text.insert(tk.END, content)
+            self.toggle_check(item_id)
     
     def on_tree_click(self, event):
         """Handle click on tree item (for checkbox)"""
@@ -511,6 +538,39 @@ class FileTreeViewer(tk.Tk):
                 if item_info["type"] == "directory":
                     self.update_children_check(item_id, False)
     
+    def show_copy_notification(self):
+        """Show a notification that content was copied to clipboard"""
+        # Remove previous notification if exists
+        if self.copy_notification:
+            self.copy_notification.destroy()
+        
+        # Create new notification
+        self.copy_notification = tk.Toplevel(self)
+        self.copy_notification.overrideredirect(True)
+        
+        # Position near the mouse
+        x = self.winfo_pointerx() + 10
+        y = self.winfo_pointery() + 10
+        
+        # Create notification content
+        frame = ttk.Frame(self.copy_notification, padding=10, relief="raised", borderwidth=1)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        label = ttk.Label(frame, text="Output copied to clipboard", font=("Arial", 12))
+        label.pack(padx=10, pady=10)
+        
+        # Position notification
+        self.copy_notification.geometry(f"+{x}+{y}")
+        
+        # Fade after 2 seconds
+        self.after(2000, self.hide_copy_notification)
+    
+    def hide_copy_notification(self):
+        """Hide copy notification"""
+        if self.copy_notification:
+            self.copy_notification.destroy()
+            self.copy_notification = None
+    
     def generate_output(self):
         """Generate text output based on checked items"""
         # Start with root directory
@@ -521,14 +581,13 @@ class FileTreeViewer(tk.Tk):
         for item_id in self.tree.get_children():
             output += self.process_item_for_output(item_id, "")
         
-        # Display in output text
-        self.output_text.delete(1.0, tk.END)
-        self.output_text.insert(tk.END, output)
-        
         # Save to clipboard
         self.clipboard_clear()
         self.clipboard_append(output)
+        
+        # Show status and notification
         self.status_text.set("Output generated and copied to clipboard")
+        self.show_copy_notification()
     
     def process_item_for_output(self, item_id, prefix):
         """Process a tree item for output generation"""
@@ -548,7 +607,7 @@ class FileTreeViewer(tk.Tk):
         # For files, include content if checked
         if item_info["type"] == "file":
             if is_checked:
-                content = get_file_content(item_info["path"], self.max_lines.get())
+                content = get_file_content(item_info["path"])
                 # Format content with prefix
                 formatted_content = '\n'.join([child_prefix + line for line in content.split('\n')])
                 output += formatted_content + "\n"
@@ -593,10 +652,18 @@ class FileTreeViewer(tk.Tk):
         dialog.transient(self)
         dialog.grab_set()
         
-        ttk.Label(dialog, text="Enter patterns to ignore (one per line):").pack(pady=10)
+        # Description label
+        ttk.Label(dialog, text="Enter patterns to ignore (one per line):").pack(pady=(10, 5))
+        ttk.Label(dialog, text="Examples: *.txt, node_modules").pack(pady=(0, 10))
         
-        text = scrolledtext.ScrolledText(dialog)
-        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # Text area
+        text = tk.Text(dialog, wrap=tk.WORD)
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Scrollbar for text
+        scrollbar = ttk.Scrollbar(text, command=text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text.config(yscrollcommand=scrollbar.set)
         
         # Populate with current patterns
         patterns = self.config_data.get("ignored_patterns", DEFAULT_CONFIG["ignored_patterns"])
@@ -627,28 +694,28 @@ class FileTreeViewer(tk.Tk):
         """Show about dialog"""
         about_text = """File Tree Viewer
 
-A graphical utility for viewing directory structure and file contents.
+Графическая утилита для просмотра структуры директорий и содержимого файлов.
 
-Features:
-- View directory tree
-- Select files to include in output
-- Generate formatted text output
-- Ignore specific file patterns
-- Copy output to clipboard
+Возможности:
+• Просмотр дерева файлов и директорий (включая скрытые)
+• Выбор файлов для включения в вывод
+• Игнорирование указанных шаблонов файлов
+• Копирование результата в буфер обмена
+• Сортировка (директории сначала, затем файлы)
 """
         
         dialog = tk.Toplevel(self)
-        dialog.title("About File Tree Viewer")
+        dialog.title("О программе File Tree Viewer")
         dialog.geometry("400x300")
         dialog.transient(self)
         dialog.grab_set()
         
-        text = scrolledtext.ScrolledText(dialog, wrap=tk.WORD)
+        text = tk.Text(dialog, wrap=tk.WORD)
         text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         text.insert(tk.END, about_text)
         text.config(state=tk.DISABLED)
         
-        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=10)
+        ttk.Button(dialog, text="Закрыть", command=dialog.destroy).pack(pady=10)
     
     def on_close(self):
         """Handle window close event"""
