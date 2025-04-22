@@ -1,0 +1,2 @@
+[console_scripts]
+file-tree-viewer = file_tree_viewer:main

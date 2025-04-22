@@ -1,0 +1,6 @@
+setup.py
+file_tree_viewer.egg-info/PKG-INFO
+file_tree_viewer.egg-info/SOURCES.txt
+file_tree_viewer.egg-info/dependency_links.txt
+file_tree_viewer.egg-info/entry_points.txt
+file_tree_viewer.egg-info/top_level.txt

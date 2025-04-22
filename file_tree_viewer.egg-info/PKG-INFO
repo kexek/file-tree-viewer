@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: file-tree-viewer
+Version: 0.1.0
+Summary: A graphical utility for viewing and exporting file trees with content
+Author: Your Name
+Author-email: your.email@example.com
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.6
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: requires-python
+Dynamic: summary
